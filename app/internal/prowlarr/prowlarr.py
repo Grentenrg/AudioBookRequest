@@ -1,6 +1,8 @@
+import asyncio
 import html
 import json
 import posixpath
+import re
 import time
 import uuid
 from datetime import datetime
@@ -247,6 +249,49 @@ _ProwlarrSearchResult = TypeAdapter(
 )
 
 
+_NUMBER_WORDS = [
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+]
+_NUMBER_WORD_PATTERN = re.compile(
+    rf"\b({'|'.join(_NUMBER_WORDS[1:])})\b", re.IGNORECASE
+)
+# Lookarounds skip decimals like "Book 4.5", which have no word spelling.
+_NUMBER_PATTERN = re.compile(r"(?<![\w.])(1[0-9]|20|[1-9])(?![\w.])")
+
+
+def query_variants(title: str) -> list[str]:
+    """
+    Indexer searches match words literally, so "Book Six" misses a release named
+    "Book 6" and the other way around. Returns the title plus its spellings with
+    numbers written as digits and as words.
+    """
+    as_digits = _NUMBER_WORD_PATTERN.sub(
+        lambda m: str(_NUMBER_WORDS.index(m[1].lower())), title
+    )
+    as_words = _NUMBER_PATTERN.sub(lambda m: _NUMBER_WORDS[int(m[1])].title(), title)
+    return list(dict.fromkeys([title, as_digits, as_words]))
+
+
 async def query_prowlarr(
     session: Session,
     client_session: ClientSession,
@@ -272,7 +317,6 @@ async def query_prowlarr(
             return cached_sources
 
     params: dict[str, int | str | list[int]] = {
-        "query": query,
         "type": "search",
         "limit": 100,
         "offset": 0,
@@ -284,6 +328,40 @@ async def query_prowlarr(
     if indexer_ids is not None:
         params["indexerIds"] = indexer_ids
 
+    results = await asyncio.gather(
+        *(
+            _search_prowlarr(
+                client_session, base_url, api_key, {**params, "query": variant}
+            )
+            for variant in query_variants(query)
+        )
+    )
+    if all(result is None for result in results):
+        return []
+    sources = list(
+        {
+            source.guid: source
+            for result in results
+            if result is not None
+            for source in result
+        }.values()
+    )
+
+    # add additional metadata using any available indexers
+    container = SessionContainer(session=session, client_session=client_session)
+    await edit_source_metadata(book, sources, container)
+
+    prowlarr_source_cache.set(sources, query)
+
+    return sources
+
+
+async def _search_prowlarr(
+    client_session: ClientSession,
+    base_url: str,
+    api_key: str,
+    params: dict[str, int | str | list[int]],
+) -> list[ProwlarrSource] | None:
     url = posixpath.join(base_url, f"api/v1/search?{urlencode(params, doseq=True)}")
 
     logger.info("Querying prowlarr", url=url)
@@ -304,7 +382,7 @@ async def query_prowlarr(
                 logger.error(
                     "Prowlarr: Failed to query", response=await response.text()
                 )
-                return []
+                return None
             search_results = _ProwlarrSearchResult.validate_python(
                 await response.json()
             )
@@ -313,7 +391,7 @@ async def query_prowlarr(
         logger.error(
             "Prowlarr query timed out", error=str(e), elapsed_time=elapsed_time
         )
-        return []
+        return None
     except Exception as e:
         elapsed_time = time.time() - start_time
         logger.error(
@@ -322,7 +400,7 @@ async def query_prowlarr(
             prowlarr_response=prowlarr_text,
             elapsed_time=elapsed_time,
         )
-        return []
+        return None
 
     elapsed_time = time.time() - start_time
     logger.info(
@@ -376,12 +454,6 @@ async def query_prowlarr(
                 )
         except KeyError as e:
             logger.error("Failed to parse source", source=result, keyerror=str(e))
-
-    # add additional metadata using any available indexers
-    container = SessionContainer(session=session, client_session=client_session)
-    await edit_source_metadata(book, sources, container)
-
-    prowlarr_source_cache.set(sources, query)
 
     return sources
 
